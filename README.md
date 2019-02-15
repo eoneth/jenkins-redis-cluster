@@ -1,4 +1,4 @@
-# jenkins-redis-cluster
+# jenkins-rancher-redis-cluster
 RedisName #k8s内 pod、pv、svc名
 replicas #pod数量
 ns  #k8s namespaces
