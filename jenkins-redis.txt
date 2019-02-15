@@ -1,0 +1,234 @@
+#!/bin/bash
+
+#定义镜像地址
+#image=192.168.19.111/base_image/${mqName}
+
+#定义nfsPath路径
+nfsPath="/opt/${RedisName}"
+
+#redis-conf configmap
+cat >redis.conf<<EOF
+appendonly yes
+cluster-enabled yes
+cluster-config-file /var/lib/redis/nodes.conf
+cluster-node-timeout 5000
+dir /var/lib/redis
+port 6379
+EOF
+
+#生成redis.conf cm
+rancher kubectl create configmap redis-conf --from-file=redis.conf --namespace=hts
+
+cat >Dockerfile<<EOF
+FROM 192.168.19.111/base_image/activemq:v1
+RUN sed -i -e "s/Replace1/${replicas}/g" -e "s#Replace2#${PEERS}#g" -e "s/Replace3/${mqName}/g" -e "s/.default./.${ns}./g" /opt/activemq/conf/activemq.xml
+EOF
+
+#/usr/bin/docker build -t ${image} -f ${WORKSPACE}/Dockerfile .
+
+#if [ $? -ne 0 ];then
+#  exit 1;
+#fi
+
+
+#echo '>>> Build cashLoanApr Complete!'
+#echo '>>> Push image to AppHome!'
+#/usr/bin/docker push ${image}
+
+for ((i=0; i<${replicas}; i++))
+do
+# 检查NFS目录
+echo ">>${i}"
+
+if [ ! -d "${nfsPath}-${i}" ]; then
+  echo ">>> 目录${nfsPath}-${i}不存在，正在创建!"
+  if mkdir ${nfsPath}-$i; then
+    if touch ${nfsPath}-$i/aa; then
+       chmod -R 777 ${nfsPath}-${i}
+       echo ">>> 目录已经创建."
+       rm  "${nfsPath}-$i/aa" -f
+    else 
+       echo ">>> 创建目录${nfsPath}-${i}失败,或目录不可写。"
+       exit 1
+    fi
+    else 
+    echo ">>> 创建目录${nfsPath}-${i}成功"
+  fi
+fi
+
+if grep -q "${nfsPath}-${i}" /etc/exports; then
+    echo ">>> 存在相应记录."
+  else
+    echo ">>> 增加NFS记录."
+    echo "${nfsPath}-${i} *(rw,no_root_squash,no_all_squash,sync)" >> /etc/exports
+    exportfs -rv  
+
+fi
+
+done
+
+#创建PV
+
+for ((i=0; i<${replicas}; i++))
+do
+if [ ! $(rancher kubectl get pv | awk -F " " '{print $1}' | grep "${RedisName}-$i") ];then
+ echo ">>>该PV不存在,增加PV."
+ 
+cat <<EOF | rancher kubectl create -f -
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: ${RedisName}-$i
+  namespace: ${ns}
+spec:
+  capacity:
+    storage: 10Gi
+  claimRef:
+    apiVersion: v1
+    kind: PersistentVolumeClaim
+    name: data-${RedisName}-$i
+    namespace: ${ns}
+  accessModes:
+    - ReadWriteMany
+  nfs:
+    server: 192.168.7.206
+    path: "${nfsPath}-$i"
+EOF
+else 
+ echo ">>>pv,${mqName}-$i已存在"
+
+fi
+
+done
+
+
+
+cat <<EOF | rancher kubectl apply -f -
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${RedisName}
+  namespace: ${ns}
+  labels:
+    app: ${RedisName}
+spec:
+  ports:
+  - name: redis-port
+    port: 6379
+  clusterIP: None
+  selector:
+    app: ${RedisName}
+    appCluster: ${RedisName}-cluster
+
+  
+EOF
+
+projectFlag=`rancher kubectl get statefulsets -n ${ns}| grep ${RedisName} | wc -l`
+# 如果存在deployment
+if [ $projectFlag -eq 1 ]; then
+  echo ">>>${RedisName}已存在，删除${RedisName}"
+  echo ">>>删除中......"
+  rancher kubectl delete statefulsets ${RedisName} -n ${ns}
+fi
+
+cat <<EOF | rancher kubectl apply  -f -
+apiVersion: apps/v1beta1
+kind: StatefulSet
+metadata:
+  name: ${RedisName}
+  namespace: ${ns}
+spec:
+  serviceName: "${RedisName}"
+  replicas: 6
+  template:
+    metadata:
+      labels:
+        app: ${RedisName}
+        appCluster: ${RedisName}-cluster
+    spec:
+      nodeSelector:
+        ${nodeSelector}
+      terminationGracePeriodSeconds: 20
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - redis
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: redis
+        image: "192.168.19.111/base_image/redis:1"
+        command:
+          - "redis-server"
+        args:
+          - "/etc/redis/redis.conf"
+          - "--protected-mode"
+          - "no"
+        resources:
+          requests:
+            cpu: "1"
+            memory: "2048Mi"
+        ports:
+            - name: redis
+              containerPort: 6379
+              protocol: "TCP"
+            - name: cluster
+              containerPort: 16379
+              protocol: "TCP"
+        volumeMounts:
+          - name: "redis-conf"
+            mountPath: "/etc/redis"
+          - name: "data"
+            mountPath: "/var/lib/redis"
+      volumes:
+      - name: "redis-conf"
+        configMap:
+          name: "redis-conf"
+          items:
+            - key: "redis.conf"
+              path: "redis.conf"
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ "ReadWriteMany" ]
+      resources:
+        requests:
+          storage: 10Gi
+
+EOF
+
+#以下步骤，手动执行
+#初始化集群
+
+
+#FROM docker.io/centos
+#MAINTAINER yan
+
+#RUN yum install wget gcc gcc-c++ make bind-utils ruby rubygems -y
+#更新yum源
+#RUN yum install centos-release-scl-rh -y
+#安装ruby2.3
+#RUN yum install rh-ruby23  -y
+#RUN scl  enable  rh-ruby23 bash
+#安装rubygem redis依赖
+#RUN wget http://rubygems.org/downloads/redis-3.3.0.gem
+#RUN gem install -l redis-3.3.0.gem
+
+#COPY redis-4.0.11/src/redis-trib.rb /usr/local/bin/redis-trib
+
+# redis 集群构建
+# rancher kubectl run -i --tty redis-trib --image=192.168.19.111/base_image/redis-trib:v1.1 --namespace sit1 --restart=Never /bin/bash
+#redis-trib create --replicas 1 \
+#  `dig +short sit1-redis-app-0.sit1-redis-service.sit1.svc.cluster.local`:6379 \
+#  `dig +short sit1-redis-app-1.sit1-redis-service.sit1.svc.cluster.local`:6379 \
+#  `dig +short sit1-redis-app-2.sit1-redis-service.sit1.svc.cluster.local`:6379 \
+#  `dig +short sit1-redis-app-3.sit1-redis-service.sit1.svc.cluster.local`:6379 \
+#  `dig +short sit1-redis-app-4.sit1-redis-service.sit1.svc.cluster.local`:6379 \
+#  `dig +short sit1-redis-app-5.sit1-redis-service.sit1.svc.cluster.local`:6379
